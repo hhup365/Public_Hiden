@@ -1,0 +1,24 @@
+name: Cleanup Logs
+on:
+  workflow_run:
+    workflows:
+      - "Hiden-cloud Auto Renew"
+    types:
+      - completed
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: 🧹 清理已完成 Run 的日志
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api \
+            --method DELETE \
+            /repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/logs
+          echo "✅ 已删除 Run ID: ${{ github.event.workflow_run.id }} 的日志"
