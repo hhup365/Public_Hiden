@@ -124,7 +124,9 @@ jobs:
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-      - name: 🚀 运行续期脚本
+      # 注意：写入 $GITHUB_ENV 只对「后续步骤」生效，对当前步骤无效。
+      # 因此注入必须独立成一个 step，再执行 app.py，否则 app.py 读不到任何账号。
+      - name: 🔑 注入环境变量
         if: env.SHOULD_RUN == 'true'
         env:
           SECRETS_JSON: ${{ toJson(secrets) }}
@@ -147,6 +149,8 @@ jobs:
               'WXPUSH_API', 'WXPUSH_TOKEN',
               # 通知（旧变量名，作为兜底）
               'TG_BOT_TOKEN', 'TG_CHAT_ID',
+              # 运行参数
+              'DUE_WITHIN_HOURS', 'RETRY_AFTER_HOURS',
           }
 
           names = sorted(n for n in (set(secrets) | set(variables))
@@ -159,6 +163,7 @@ jobs:
                   value = variables.get(name)
               if value in (None, ''):
                   continue
+              # GITHUB_ENV 用多行分隔符写入，避免密码里的特殊字符被截断
               out.append(f'{name}<<__EOF__\n{value}\n__EOF__')
 
           with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as fh:
@@ -166,8 +171,29 @@ jobs:
 
           # 只打印变量名，不打印值
           print('已注入变量: ' + ', '.join(names))
+          if not any(n.startswith('HIDEN_ACCOUNT_') for n in names):
+              print('::error::未找到任何 HIDEN_ACCOUNT_n，请检查仓库 Secrets 是否配置了 HIDEN_ACCOUNT_1')
           PY
 
+      - name: ✅ 校验变量已生效
+        if: env.SHOULD_RUN == 'true'
+        run: |
+          # 确认注入的变量真的进入了本步骤的环境（值只判断长度，不打印内容）
+          for i in 1 2 3 4 5; do
+            name="HIDEN_ACCOUNT_$i"
+            value="$(printenv "$name" || true)"
+            if [ -n "$value" ]; then
+              echo "✅ $name 已生效（长度 ${#value}）"
+            fi
+          done
+          if [ -z "$(printenv HIDEN_ACCOUNT_1 || true)" ]; then
+            echo "::error::HIDEN_ACCOUNT_1 未注入成功。请确认在 Settings → Secrets and variables → Actions 的 Secrets 中已添加 HIDEN_ACCOUNT_1（格式：邮箱 密码）"
+            exit 1
+          fi
+
+      - name: 🚀 运行续期脚本
+        if: env.SHOULD_RUN == 'true'
+        run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
 
       - name: 📸 上传调试截图
