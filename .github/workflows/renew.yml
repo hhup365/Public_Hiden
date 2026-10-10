@@ -3,7 +3,6 @@ name: Auto Renew HidenCloud
 on:
   workflow_dispatch:
   schedule:
-    # 每日运行 2 次，先检查 state.json，只有存在需要续期的账号才安装环境并执行
     - cron: '0 1 * * *'
     - cron: '0 13 * * *'
 
@@ -23,8 +22,6 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           persist-credentials: true
 
-      # ── 预检：读取 state.json，判断是否有账号需要续期 ──
-      # 无账号到期时直接结束，后续安装依赖/浏览器的步骤全部跳过
       - name: 🔎 检查是否有账号需要续期
         id: precheck
         env:
@@ -32,10 +29,11 @@ jobs:
           VARS_JSON: ${{ toJson(vars) }}
         run: |
           python3 - <<'PY'
-          import json, os, time
+          import json
+          import os
+          import time
 
           variables = json.loads(os.environ.get('VARS_JSON') or '{}')
-          # 阈值可由仓库变量 DUE_WITHIN_HOURS 覆盖，默认 24 小时
           due_within_hours = float(variables.get('DUE_WITHIN_HOURS') or 24)
 
           accounts = {}
@@ -58,7 +56,6 @@ jobs:
               acc_state = state.get(f'ACCOUNT_{acc_id}') or {}
               due_ts = acc_state.get('due_ts') or 0
 
-              # 上次续期失败且仍在退避窗口内 → 本次不跑，同时避免无谓的环境安装
               retry_at = acc_state.get('retry_at') or 0
               if acc_state.get('last_result') == 'failed' and retry_at and now < retry_at:
                   print(f'⏳ 账号 {acc_id}: 上次续期失败，退避中（{int((retry_at - now) / 60)} 分钟后重试），跳过')
@@ -114,8 +111,6 @@ jobs:
             && echo "✅ sing-box 就绪" \
             || echo "⚠️ sing-box 下载失败，本次将无法运行"
 
-      # 可选兜底：未使用账号级 PROXY_URL_n 时可由 NODE_LINK 提供全局代理
-      # 注意各账号仍必须配置自己的 PROXY_URL_n，此步骤仅作为额外保险
       - name: ⚙ 设置全局代理（可选 NODE_LINK）
         if: env.SHOULD_RUN == 'true'
         continue-on-error: true
@@ -124,32 +119,26 @@ jobs:
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-      # 注意：写入 $GITHUB_ENV 只对「后续步骤」生效，对当前步骤无效。
-      # 因此注入必须独立成一个 step，再执行 app.py，否则 app.py 读不到任何账号。
       - name: 🔑 注入环境变量
         if: env.SHOULD_RUN == 'true'
         env:
           SECRETS_JSON: ${{ toJson(secrets) }}
           VARS_JSON: ${{ toJson(vars) }}
         run: |
-          # 只挑选需要透传的变量名，值不会打印到日志
           python3 - <<'PY'
-          import json, os, re
+          import json
+          import os
+          import re
 
           secrets = json.loads(os.environ.get('SECRETS_JSON') or '{}')
           variables = json.loads(os.environ.get('VARS_JSON') or '{}')
 
-          # 账号级变量按编号无限匹配，与 Test-hiden-cloud 的 HIDEN_ACCOUNT_N 保持一致
           account_pattern = re.compile(r'^(HIDEN_ACCOUNT|PROXY_URL|PROXY_LOCK)_\d+$')
           fixed_names = {
-              # 兼容旧版单账号变量
               'EMAIL', 'PASSWORD', 'PROXY_URL', 'PROXY_LOCK', 'NODE_LINK',
-              # 通知（新变量名）
               'TG_TOKEN', 'TG_CHAT', 'SMTP_CONFIG', 'EMAIL_CHAT',
               'WXPUSH_API', 'WXPUSH_TOKEN',
-              # 通知（旧变量名，作为兜底）
               'TG_BOT_TOKEN', 'TG_CHAT_ID',
-              # 运行参数
               'DUE_WITHIN_HOURS', 'RETRY_AFTER_HOURS',
           }
 
@@ -163,13 +152,11 @@ jobs:
                   value = variables.get(name)
               if value in (None, ''):
                   continue
-              # GITHUB_ENV 用多行分隔符写入，避免密码里的特殊字符被截断
               out.append(f'{name}<<__EOF__\n{value}\n__EOF__')
 
           with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as fh:
               fh.write('\n'.join(out) + '\n')
 
-          # 只打印变量名，不打印值
           print('已注入变量: ' + ', '.join(names))
           if not any(n.startswith('HIDEN_ACCOUNT_') for n in names):
               print('::error::未找到任何 HIDEN_ACCOUNT_n，请检查仓库 Secrets 是否配置了 HIDEN_ACCOUNT_1')
@@ -178,7 +165,6 @@ jobs:
       - name: ✅ 校验变量已生效
         if: env.SHOULD_RUN == 'true'
         run: |
-          # 确认注入的变量真的进入了本步骤的环境（值只判断长度，不打印内容）
           for i in 1 2 3 4 5; do
             name="HIDEN_ACCOUNT_$i"
             value="$(printenv "$name" || true)"
@@ -218,7 +204,6 @@ jobs:
             git push || true
           fi
 
-      # 更新时间到time.txt,避免6个月未更新导致工作流暂停
       - name: 🕒 更新时间
         run: |
           git config user.name "github-actions[bot]"
