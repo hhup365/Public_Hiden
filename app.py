@@ -1,151 +1,180 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+import base64
+import html as html_mod
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import time
+from urllib.parse import parse_qs, unquote, urlparse
 
-import os,re,sys,time,random,json,base64,shutil,subprocess,html as html_mod,requests
-try:
-    from urllib.parse import urlparse, parse_qs, unquote
-except ImportError:
-    from urlparse import urlparse, parse_qs
-    from urllib import unquote
+import requests
+
 try:
     from patchright.sync_api import sync_playwright
+
     USING_PATCHRIGHT = True
 except ImportError:
     from playwright.sync_api import sync_playwright
+
     USING_PATCHRIGHT = False
 
-# =========================================================
-# 环境变量（可在 Settings → Secrets and variables → Actions 里配置）
-# 多账号格式（与 Test-hiden-cloud 完全一致，可直接照搬）：
-#   HIDEN_ACCOUNT_1=你的邮箱 你的密码
-#   PROXY_URL_1=vless://... / vmess://... / socks5://...
-#   PROXY_LOCK_1=true|false
-# 账号序号从 1 开始，支持任意个（2、3、4...）。
-#
-# 环境隔离硬性要求：每个账号必须配置属于自己的 PROXY_URL_n，且各账号的代理
-# 不得重复（禁止同一代理给多个账号共用）；不满足则直接终止运行。
-# 登录一律使用账号密码，不再使用 cookie 免密。
-# =========================================================
 
-TG_TOKEN     = os.environ.get('TG_TOKEN') or os.environ.get('TG_BOT_TOKEN') or ""      # Telegram Bot Token,可选
-TG_CHAT      = os.environ.get('TG_CHAT') or os.environ.get('TG_CHAT_ID') or ""         # Telegram Chat ID,可选
-SMTP_CONFIG  = os.environ.get('SMTP_CONFIG') or ""                                     # SMTP JSON,可选
-EMAIL_CHAT   = os.environ.get('EMAIL_CHAT') or ""                                      # 收件邮箱,可选
-WXPUSH_API   = os.environ.get('WXPUSH_API') or ""                                      # WxPush 地址,可选
-WXPUSH_TOKEN = os.environ.get('WXPUSH_TOKEN') or ""                                    # WxPush Token,可选
+TG_TOKEN = os.environ.get("TG_TOKEN") or os.environ.get("TG_BOT_TOKEN") or ""
+TG_CHAT = os.environ.get("TG_CHAT") or os.environ.get("TG_CHAT_ID") or ""
+SMTP_CONFIG = os.environ.get("SMTP_CONFIG") or ""
+EMAIL_CHAT = os.environ.get("EMAIL_CHAT") or ""
+WXPUSH_API = os.environ.get("WXPUSH_API") or ""
+WXPUSH_TOKEN = os.environ.get("WXPUSH_TOKEN") or ""
 
-# 下面几项是按账号动态切换的运行期变量（每个账号开始前重新赋值）
-EMAIL        = ""     # 当前账号邮箱
-PASSWORD     = ""     # 当前账号密码
-CURRENT_ACCOUNT = {}  # 当前账号完整信息
-LOGIN_METHOD = "未知"  # 当前账号实际生效的登录方式
+
+EMAIL = ""
+PASSWORD = ""
+CURRENT_ACCOUNT = {}
+LOGIN_METHOD = "未知"
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
 
-# --- 代理配置 ---
-# 账号级：PROXY_URL_n → 本地 mixed 代理 127.0.0.1:(PROXY_PORT_BASE + n)
-# 每个账号强制使用自己的代理，不提供直连或全局代理回落
-IS_PROXY         = False        # 运行期按账号切换
-PROXY_SERVER     = ""           # 运行期按账号切换
-REQUESTS_PROXIES = None         # 运行期按账号切换
-PROXY_PORT_BASE   = 10800   # PROXY_URL_n 映射到 10800 + n
-SINGBOX_BIN       = os.environ.get('SINGBOX_BIN') or os.path.join(os.getcwd(), 'sing-box')
-SINGBOX_CONFIG    = os.environ.get('SINGBOX_CONFIG') or os.path.join(os.getcwd(), 'config.json')
-SINGBOX_LOG       = os.path.join(os.getcwd(), 'singbox.log')
-STATE_FILE        = os.path.join(os.getcwd(), 'state.json')
-# 距离到期不足该小时数才续期（默认 24 小时）
-DUE_WITHIN_HOURS  = float(os.environ.get('DUE_WITHIN_HOURS') or 24)
-# 续期失败后多少小时才重试（默认 6 小时；每日 2 次运行即下次运行就会重试）
-RETRY_AFTER_HOURS = float(os.environ.get('RETRY_AFTER_HOURS') or 6)
-SINGBOX_PROCESS   = None
 
-# Cloudflare 整页挑战 / Turnstile 组件共用的 iframe 选择器
+IS_PROXY = False
+PROXY_SERVER = ""
+PROXY_PORT_BASE = 10800
+SINGBOX_BIN = os.environ.get("SINGBOX_BIN") or os.path.join(os.getcwd(), "sing-box")
+SINGBOX_CONFIG = os.environ.get("SINGBOX_CONFIG") or os.path.join(
+    os.getcwd(), "config.json"
+)
+SINGBOX_LOG = os.path.join(os.getcwd(), "singbox.log")
+STATE_FILE = os.path.join(os.getcwd(), "state.json")
+
+DUE_WITHIN_HOURS = float(os.environ.get("DUE_WITHIN_HOURS") or 24)
+
+RETRY_AFTER_HOURS = float(os.environ.get("RETRY_AFTER_HOURS") or 6)
+SINGBOX_PROCESS = None
+
+
 CF_IFRAME_SELECTOR = 'iframe[src*="challenges.cloudflare.com"]'
 
-# 按运行平台选择 UA
-if sys.platform == 'win32':
-    DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-else:
-    DEFAULT_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
 
-# 日志
+if sys.platform == "win32":
+    DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+else:
+    DEFAULT_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
+
 def log(message):
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+    print(
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {redact_sensitive_text(message)}",
+        flush=True,
+    )
+
 
 def screenshot(page, name):
-    """截图并按账号归入 art/acc_N/，方便区分是哪个账号出的问题"""
+
     try:
-        acc_id = CURRENT_ACCOUNT.get('id') or '0'
-        out_dir = os.path.join(os.getcwd(), 'art', f'acc_{acc_id}')
+        acc_id = CURRENT_ACCOUNT.get("id") or "0"
+        out_dir = os.path.join(os.getcwd(), "art", f"acc_{acc_id}")
         os.makedirs(out_dir, exist_ok=True)
         page.screenshot(path=os.path.join(out_dir, f"{name}.png"))
     except Exception as e:
         log(f"🔍 截图失败: {e}")
 
-# =========================================================
-# 多账号 / 工具函数
-# =========================================================
 
 def mask_email(email):
-    """邮箱打码：abcd***@***.com"""
-    if not email or '@' not in email:
-        return '***'
-    name, domain = email.split('@', 1)
-    masked_name = (name[:3] + '***') if len(name) > 3 else (name + '***')
-    tld = domain.split('.')[-1] if '.' in domain else 'com'
+
+    if not email or "@" not in email:
+        return "***"
+    name, domain = email.split("@", 1)
+    masked_name = (name[:3] + "***") if len(name) > 3 else (name + "***")
+    tld = domain.split(".")[-1] if "." in domain else "com"
     return f"{masked_name}@***.{tld}"
 
+
 def mask_ip(ip):
-    """IP 打码：1.***.***.4"""
-    if not ip:
-        return '***.***.***.***'
-    parts = ip.strip().split('.')
-    return f"{parts[0]}.***.***.{parts[3]}" if len(parts) == 4 else '***'
+    parts = str(ip or "").strip().split(".")
+    if len(parts) == 4 and all(
+        part.isascii() and part.isdecimal() and 0 <= int(part) <= 255 for part in parts
+    ):
+        return f"{parts[0]}.*.*.{parts[3]}"
+    return "***"
+
+
+def mask_server_id(server_id):
+    value = str(server_id or "").strip()
+    if not value.isascii() or not value.isdecimal() or len(value) <= 4:
+        return "*" * len(value) if value.isdecimal() else "***"
+    return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
+
+
+def redact_sensitive_text(text):
+    value = str(text or "")
+    for secret in (TG_TOKEN, WXPUSH_TOKEN):
+        if secret:
+            value = value.replace(secret, "***")
+    value = re.sub(
+        r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])",
+        lambda match: mask_ip(match.group()),
+        value,
+    )
+    return re.sub(
+        r"(/service/|Server ID:\s*|Free Server\s*#)(\d+)(?![\d*])",
+        lambda match: match.group(1) + mask_server_id(match.group(2)),
+        value,
+        flags=re.IGNORECASE,
+    )
+
 
 def escape_html(text):
-    return html_mod.escape(str(text or ''), quote=False)
+    return html_mod.escape(redact_sensitive_text(text), quote=False)
+
 
 def get_accounts():
-    """扫描 HIDEN_ACCOUNT_N，返回账号列表（含各自的代理与锁）"""
+
     accounts = []
     for key in list(os.environ.keys()):
-        match = re.match(r'^HIDEN_ACCOUNT_(\d+)$', key)
+        match = re.match(r"^HIDEN_ACCOUNT_(\d+)$", key)
         if not match:
             continue
         acc_id = match.group(1)
-        raw = (os.environ.get(key) or '').strip()
-        parts = re.split(r'\s+', raw)
+        raw = (os.environ.get(key) or "").strip()
+        parts = re.split(r"\s+", raw)
         if len(parts) < 2 or not parts[0] or not parts[1]:
             log(f"⚠️ HIDEN_ACCOUNT_{acc_id} 格式应为『邮箱 密码』，已跳过")
             continue
-        accounts.append({
-            'id': acc_id,
-            'username': parts[0],
-            'password': parts[1],
-            'proxy_url': (os.environ.get(f'PROXY_URL_{acc_id}') or '').strip(),
-            'proxy_lock': os.environ.get(f'PROXY_LOCK_{acc_id}', 'true').lower() != 'false',
-            'port': PROXY_PORT_BASE + int(acc_id),
-        })
-    accounts.sort(key=lambda a: int(a['id']))
+        accounts.append(
+            {
+                "id": acc_id,
+                "username": parts[0],
+                "password": parts[1],
+                "proxy_url": (os.environ.get(f"PROXY_URL_{acc_id}") or "").strip(),
+                "proxy_lock": os.environ.get(f"PROXY_LOCK_{acc_id}", "true").lower()
+                != "false",
+                "port": PROXY_PORT_BASE + int(acc_id),
+            }
+        )
+    accounts.sort(key=lambda a: int(a["id"]))
 
-    # 兼容旧版单账号变量（同样要求配置代理）
-    if not accounts and os.environ.get('EMAIL') and os.environ.get('PASSWORD'):
-        accounts.append({
-            'id': '1',
-            'username': (os.environ.get('EMAIL') or '').strip(),
-            'password': (os.environ.get('PASSWORD') or '').strip(),
-            'proxy_url': (os.environ.get('PROXY_URL') or '').strip(),
-            'proxy_lock': os.environ.get('PROXY_LOCK', 'true').lower() != 'false',
-            'port': PROXY_PORT_BASE + 1,
-            'legacy': True,
-        })
+    if not accounts and os.environ.get("EMAIL") and os.environ.get("PASSWORD"):
+        accounts.append(
+            {
+                "id": "1",
+                "username": (os.environ.get("EMAIL") or "").strip(),
+                "password": (os.environ.get("PASSWORD") or "").strip(),
+                "proxy_url": (os.environ.get("PROXY_URL") or "").strip(),
+                "proxy_lock": os.environ.get("PROXY_LOCK", "true").lower() != "false",
+                "port": PROXY_PORT_BASE + 1,
+                "legacy": True,
+            }
+        )
     return accounts
 
+
 def validate_proxy_isolation(accounts):
-    """强制一账号一代理：缺代理、代理重复都视为不合格，返回错误说明列表"""
+
     problems = []
-    missing = [a['id'] for a in accounts if not a['proxy_url']]
+    missing = [a["id"] for a in accounts if not a["proxy_url"]]
     if missing:
         problems.append(
             "以下账号未配置代理（环境隔离要求每个账号必须有自己的 PROXY_URL_n）："
@@ -154,316 +183,339 @@ def validate_proxy_isolation(accounts):
 
     seen = {}
     for acc in accounts:
-        url = acc['proxy_url']
+        url = acc["proxy_url"]
         if url:
-            seen.setdefault(url, []).append(acc['id'])
+            seen.setdefault(url, []).append(acc["id"])
     for url, ids in seen.items():
         if len(ids) > 1:
-            preview = url if len(url) <= 40 else url[:37] + '...'
             problems.append(
-                f"以下账号共用了同一个代理（禁止同代理多账号）：账号 {'、'.join(ids)} → {preview}"
+                f"以下账号共用了同一个代理（禁止同代理多账号）：账号 {'、'.join(ids)}"
             )
     return problems
 
+
 def accounts_to_renew(accounts, state):
-    """按 state.json 判断哪些账号需要续期：
-    未到期 → 不跑；到期/临近到期/无记录 → 需要跑。
-    上次续期失败的账号会在退避时间到达后重试，不会被静默跳过。"""
+
     now_ts = int(time.time())
     threshold = DUE_WITHIN_HOURS * 3600
     pending = []
     for acc in accounts:
         acc_state = state.get(f"ACCOUNT_{acc['id']}") or {}
-        last_failed = acc_state.get('last_result') == 'failed'
-        retry_at = acc_state.get('retry_at') or 0
+        last_failed = acc_state.get("last_result") == "failed"
+        retry_at = acc_state.get("retry_at") or 0
 
         if last_failed and retry_at and now_ts < retry_at:
-            log(f"⏳ 账号 {acc['id']} 上次续期失败，退避中（{int((retry_at - now_ts) / 60)} 分钟后重试）")
+            log(
+                f"⏳ 账号 {acc['id']} 上次续期失败，退避中（{int((retry_at - now_ts) / 60)} 分钟后重试）"
+            )
             continue
 
-        due_ts = acc_state.get('due_ts') or 0
-        due_date = acc_state.get('due_date') or '未知'
+        due_ts = acc_state.get("due_ts") or 0
+        due_date = acc_state.get("due_date") or "未知"
         if not due_ts:
-            # state 里没有该账号的到期信息（首次运行或上次没取到），需要跑一次补全
+
             log(f"🆕 账号 {acc['id']} 在 state.json 中无到期记录，纳入本次运行")
-            pending.append(acc['id'])
+            pending.append(acc["id"])
             continue
         remaining = due_ts - now_ts
         if remaining <= threshold:
             hours = remaining / 3600
-            log(f"⏰ 账号 {acc['id']} 距离到期 {hours:.1f} 小时（到期日 {due_date}），需要续期")
-            pending.append(acc['id'])
+            log(
+                f"⏰ 账号 {acc['id']} 距离到期 {hours:.1f} 小时（到期日 {due_date}），需要续期"
+            )
+            pending.append(acc["id"])
         else:
-            log(f"✅ 账号 {acc['id']} 距离到期 {remaining / 3600:.1f} 小时（到期日 {due_date}），本次跳过")
+            log(
+                f"✅ 账号 {acc['id']} 距离到期 {remaining / 3600:.1f} 小时（到期日 {due_date}），本次跳过"
+            )
     return pending
 
-# =========================================================
-# 账号级代理：PROXY_URL_n → sing-box 多入站配置（每个账号独立端口）
-# =========================================================
 
 def _parse_proxy_outbound(url):
-    """把分享链接解析成 sing-box outbound（字段与 proxyurl.js 对齐）"""
-    url = (url or '').strip()
+
+    url = (url or "").strip()
     if not url:
         return None
-    if '://' not in url:
-        # 订阅链接可能是 base64，取第一行有效节点
+    if "://" not in url:
+
         try:
-            padded = url.replace('-', '+').replace('_', '/')
-            padded += '=' * ((4 - len(padded) % 4) % 4)
-            decoded = base64.b64decode(padded).decode('utf-8', 'ignore')
-            url = next((l.strip() for l in decoded.splitlines() if '://' in l), '')
+            padded = url.replace("-", "+").replace("_", "/")
+            padded += "=" * ((4 - len(padded) % 4) % 4)
+            decoded = base64.b64decode(padded).decode("utf-8", "ignore")
+            url = next((l.strip() for l in decoded.splitlines() if "://" in l), "")
         except Exception:
             return None
-    if '://' not in url:
+    if "://" not in url:
         return None
 
-    scheme = url.split('://')[0].lower()
+    scheme = url.split("://")[0].lower()
     try:
-        if scheme == 'vmess':
-            payload = url.split('://', 1)[1]
-            payload += '=' * ((4 - len(payload) % 4) % 4)
-            cfg = json.loads(base64.b64decode(payload).decode('utf-8', 'ignore'))
+        if scheme == "vmess":
+            payload = url.split("://", 1)[1]
+            payload += "=" * ((4 - len(payload) % 4) % 4)
+            cfg = json.loads(base64.b64decode(payload).decode("utf-8", "ignore"))
             out = {
-                'type': 'vmess',
-                'server': cfg.get('add', ''),
-                'server_port': int(cfg.get('port') or 443),
-                'uuid': cfg.get('id', ''),
-                'security': cfg.get('scy') or 'auto',
-                'alter_id': int(cfg.get('aid') or 0),
+                "type": "vmess",
+                "server": cfg.get("add", ""),
+                "server_port": int(cfg.get("port") or 443),
+                "uuid": cfg.get("id", ""),
+                "security": cfg.get("scy") or "auto",
+                "alter_id": int(cfg.get("aid") or 0),
             }
-            tls_flag = cfg.get('tls') or ''
-            if tls_flag in ('tls', 'anytls') or cfg.get('sni'):
-                tls = {'enabled': True}
-                if cfg.get('sni') or cfg.get('host'):
-                    tls['server_name'] = cfg.get('sni') or cfg.get('host')
-                if cfg.get('alpn'):
-                    tls['alpn'] = [a for a in str(cfg['alpn']).split(',') if a]
-                if tls_flag == 'anytls':
-                    tls['insecure'] = True
-                out['tls'] = tls
-            if cfg.get('net') == 'ws':
-                transport = {'type': 'ws'}
-                if cfg.get('path'):
-                    transport['path'] = cfg['path']
-                if cfg.get('host'):
-                    transport['headers'] = {'Host': cfg['host']}
-                out['transport'] = transport
+            tls_flag = cfg.get("tls") or ""
+            if tls_flag in ("tls", "anytls") or cfg.get("sni"):
+                tls = {"enabled": True}
+                if cfg.get("sni") or cfg.get("host"):
+                    tls["server_name"] = cfg.get("sni") or cfg.get("host")
+                if cfg.get("alpn"):
+                    tls["alpn"] = [a for a in str(cfg["alpn"]).split(",") if a]
+                if tls_flag == "anytls":
+                    tls["insecure"] = True
+                out["tls"] = tls
+            if cfg.get("net") == "ws":
+                transport = {"type": "ws"}
+                if cfg.get("path"):
+                    transport["path"] = cfg["path"]
+                if cfg.get("host"):
+                    transport["headers"] = {"Host": cfg["host"]}
+                out["transport"] = transport
             return out
 
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
-        get = lambda k, d='': (params.get(k, [d]) or [d])[0]
+        get = lambda k, d="": (params.get(k, [d]) or [d])[0]
 
-        if scheme in ('socks5', 'socks', 'socks5h'):
+        if scheme in ("socks5", "socks", "socks5h"):
             out = {
-                'type': 'socks',
-                'server': parsed.hostname,
-                'server_port': int(parsed.port or 1080),
-                'version': '5',
+                "type": "socks",
+                "server": parsed.hostname,
+                "server_port": int(parsed.port or 1080),
+                "version": "5",
             }
             if parsed.username:
-                out['username'] = unquote(parsed.username)
+                out["username"] = unquote(parsed.username)
             if parsed.password:
-                out['password'] = unquote(parsed.password)
+                out["password"] = unquote(parsed.password)
             return out
 
-        if scheme in ('http', 'https'):
+        if scheme in ("http", "https"):
             out = {
-                'type': 'http',
-                'server': parsed.hostname,
-                'server_port': int(parsed.port or (443 if scheme == 'https' else 8080)),
+                "type": "http",
+                "server": parsed.hostname,
+                "server_port": int(parsed.port or (443 if scheme == "https" else 8080)),
             }
             if parsed.username:
-                out['username'] = unquote(parsed.username)
+                out["username"] = unquote(parsed.username)
             if parsed.password:
-                out['password'] = unquote(parsed.password)
-            if scheme == 'https':
-                out['tls'] = {'enabled': True}
+                out["password"] = unquote(parsed.password)
+            if scheme == "https":
+                out["tls"] = {"enabled": True}
             return out
 
-        if scheme == 'vless':
+        if scheme == "vless":
             out = {
-                'type': 'vless',
-                'server': parsed.hostname,
-                'server_port': int(parsed.port or 443),
-                'uuid': unquote(parsed.username or ''),
+                "type": "vless",
+                "server": parsed.hostname,
+                "server_port": int(parsed.port or 443),
+                "uuid": unquote(parsed.username or ""),
             }
-            flow = get('flow')
+            flow = get("flow")
             if flow:
-                out['flow'] = flow
-            security = get('security')
-            if security in ('tls', 'reality', 'anytls'):
-                tls = {'enabled': True}
-                if get('sni'):
-                    tls['server_name'] = get('sni')
-                if get('alpn'):
-                    tls['alpn'] = [a for a in get('alpn').split(',') if a]
-                if get('fp'):
-                    tls['utls'] = {'enabled': True, 'fingerprint': get('fp')}
-                if get('insecure') in ('1', 'true') or get('allowInsecure') in ('1', 'true') or security == 'anytls':
-                    tls['insecure'] = True
-                if security == 'reality':
-                    reality = {'enabled': True}
-                    if get('pbk'):
-                        reality['public_key'] = get('pbk')
-                    if get('sid'):
-                        reality['short_id'] = get('sid')
-                    tls['reality'] = reality
-                out['tls'] = tls
-            if get('type') == 'ws':
-                transport = {'type': 'ws'}
-                if get('path'):
-                    transport['path'] = unquote(get('path'))
-                if get('host'):
-                    transport['headers'] = {'Host': get('host')}
-                out['transport'] = transport
+                out["flow"] = flow
+            security = get("security")
+            if security in ("tls", "reality", "anytls"):
+                tls = {"enabled": True}
+                if get("sni"):
+                    tls["server_name"] = get("sni")
+                if get("alpn"):
+                    tls["alpn"] = [a for a in get("alpn").split(",") if a]
+                if get("fp"):
+                    tls["utls"] = {"enabled": True, "fingerprint": get("fp")}
+                if (
+                    get("insecure") in ("1", "true")
+                    or get("allowInsecure") in ("1", "true")
+                    or security == "anytls"
+                ):
+                    tls["insecure"] = True
+                if security == "reality":
+                    reality = {"enabled": True}
+                    if get("pbk"):
+                        reality["public_key"] = get("pbk")
+                    if get("sid"):
+                        reality["short_id"] = get("sid")
+                    tls["reality"] = reality
+                out["tls"] = tls
+            if get("type") == "ws":
+                transport = {"type": "ws"}
+                if get("path"):
+                    transport["path"] = unquote(get("path"))
+                if get("host"):
+                    transport["headers"] = {"Host": get("host")}
+                out["transport"] = transport
             return out
 
-        if scheme == 'trojan':
+        if scheme == "trojan":
             out = {
-                'type': 'trojan',
-                'server': parsed.hostname,
-                'server_port': int(parsed.port or 443),
-                'password': unquote(parsed.username or ''),
+                "type": "trojan",
+                "server": parsed.hostname,
+                "server_port": int(parsed.port or 443),
+                "password": unquote(parsed.username or ""),
             }
-            if get('security', 'tls') in ('tls', 'anytls'):
-                tls = {'enabled': True}
-                if get('sni'):
-                    tls['server_name'] = get('sni')
-                if get('alpn'):
-                    tls['alpn'] = [a for a in get('alpn').split(',') if a]
-                if get('insecure') in ('1', 'true') or get('allowInsecure') in ('1', 'true') or get('security') == 'anytls':
-                    tls['insecure'] = True
-                out['tls'] = tls
-            if get('type') == 'ws':
-                transport = {'type': 'ws'}
-                if get('path'):
-                    transport['path'] = unquote(get('path'))
-                if get('host'):
-                    transport['headers'] = {'Host': get('host')}
-                out['transport'] = transport
+            if get("security", "tls") in ("tls", "anytls"):
+                tls = {"enabled": True}
+                if get("sni"):
+                    tls["server_name"] = get("sni")
+                if get("alpn"):
+                    tls["alpn"] = [a for a in get("alpn").split(",") if a]
+                if (
+                    get("insecure") in ("1", "true")
+                    or get("allowInsecure") in ("1", "true")
+                    or get("security") == "anytls"
+                ):
+                    tls["insecure"] = True
+                out["tls"] = tls
+            if get("type") == "ws":
+                transport = {"type": "ws"}
+                if get("path"):
+                    transport["path"] = unquote(get("path"))
+                if get("host"):
+                    transport["headers"] = {"Host": get("host")}
+                out["transport"] = transport
             return out
 
-        if scheme in ('hy2', 'hysteria2'):
+        if scheme in ("hy2", "hysteria2"):
             out = {
-                'type': 'hysteria2',
-                'server': parsed.hostname,
-                'server_port': int(parsed.port or 443),
-                'password': unquote(parsed.username or ''),
+                "type": "hysteria2",
+                "server": parsed.hostname,
+                "server_port": int(parsed.port or 443),
+                "password": unquote(parsed.username or ""),
             }
-            tls = {'enabled': True}
-            if get('sni'):
-                tls['server_name'] = get('sni')
-            if get('alpn'):
-                tls['alpn'] = [a for a in get('alpn').split(',') if a]
-            if get('insecure') in ('1', 'true') or get('allowInsecure') in ('1', 'true'):
-                tls['insecure'] = True
-            out['tls'] = tls
+            tls = {"enabled": True}
+            if get("sni"):
+                tls["server_name"] = get("sni")
+            if get("alpn"):
+                tls["alpn"] = [a for a in get("alpn").split(",") if a]
+            if get("insecure") in ("1", "true") or get("allowInsecure") in (
+                "1",
+                "true",
+            ):
+                tls["insecure"] = True
+            out["tls"] = tls
             return out
 
-        if scheme == 'tuic':
-            user_part = unquote(parsed.username or '')
-            pass_part = unquote(parsed.password or '')
-            if ':' in user_part and not pass_part:
-                uuid, password = user_part.split(':', 1)
+        if scheme == "tuic":
+            user_part = unquote(parsed.username or "")
+            pass_part = unquote(parsed.password or "")
+            if ":" in user_part and not pass_part:
+                uuid, password = user_part.split(":", 1)
             else:
                 uuid, password = user_part, pass_part
             out = {
-                'type': 'tuic',
-                'server': parsed.hostname,
-                'server_port': int(parsed.port or 443),
-                'uuid': uuid,
-                'password': password,
-                'congestion_control': get('congestion_control', 'bbr'),
+                "type": "tuic",
+                "server": parsed.hostname,
+                "server_port": int(parsed.port or 443),
+                "uuid": uuid,
+                "password": password,
+                "congestion_control": get("congestion_control", "bbr"),
             }
-            tls = {'enabled': True}
-            if get('sni'):
-                tls['server_name'] = get('sni')
-            if get('alpn'):
-                tls['alpn'] = [a for a in get('alpn').split(',') if a]
-            if get('insecure') in ('1', 'true') or get('allowInsecure') in ('1', 'true'):
-                tls['insecure'] = True
-            out['tls'] = tls
+            tls = {"enabled": True}
+            if get("sni"):
+                tls["server_name"] = get("sni")
+            if get("alpn"):
+                tls["alpn"] = [a for a in get("alpn").split(",") if a]
+            if get("insecure") in ("1", "true") or get("allowInsecure") in (
+                "1",
+                "true",
+            ):
+                tls["insecure"] = True
+            out["tls"] = tls
             return out
 
-        if scheme in ('ss', 'shadowsocks'):
-            user_part = unquote(parsed.username or '')
-            pass_part = unquote(parsed.password or '')
+        if scheme in ("ss", "shadowsocks"):
+            user_part = unquote(parsed.username or "")
+            pass_part = unquote(parsed.password or "")
             auth = f"{user_part}:{pass_part}" if pass_part else user_part
             method, password = user_part, pass_part
             try:
-                padded = auth.replace('-', '+').replace('_', '/')
-                padded += '=' * ((4 - len(padded) % 4) % 4)
-                decoded = base64.b64decode(padded).decode('utf-8', 'ignore')
-                if ':' in decoded:
-                    method, password = decoded.split(':', 1)
+                padded = auth.replace("-", "+").replace("_", "/")
+                padded += "=" * ((4 - len(padded) % 4) % 4)
+                decoded = base64.b64decode(padded).decode("utf-8", "ignore")
+                if ":" in decoded:
+                    method, password = decoded.split(":", 1)
             except Exception:
                 pass
             return {
-                'type': 'shadowsocks',
-                'server': parsed.hostname,
-                'server_port': int(parsed.port or 8388),
-                'method': method,
-                'password': password,
+                "type": "shadowsocks",
+                "server": parsed.hostname,
+                "server_port": int(parsed.port or 8388),
+                "method": method,
+                "password": password,
             }
     except Exception as e:
         log(f"⚠️ 解析代理链接失败: {e}")
     return None
 
+
 def start_singbox(accounts):
-    """为配置了 PROXY_URL_n 的账号生成 sing-box 配置并启动本地代理"""
+
     global SINGBOX_PROCESS
-    proxied = [a for a in accounts if a.get('proxy_url')]
+    proxied = [a for a in accounts if a.get("proxy_url")]
     if not proxied:
         return
 
     if not os.path.exists(SINGBOX_BIN) and not shutil.which(SINGBOX_BIN):
         log(f"⚠️ 未找到 sing-box 可执行文件（{SINGBOX_BIN}），账号级代理将被跳过")
         for a in proxied:
-            a['proxy_ready'] = False
+            a["proxy_ready"] = False
         return
 
     inbounds, outbounds, rules = [], [], []
     for acc in proxied:
-        outbound = _parse_proxy_outbound(acc['proxy_url'])
+        outbound = _parse_proxy_outbound(acc["proxy_url"])
         tag = f"proxy_{acc['id']}"
         if not outbound:
-            log(f"⚠️ 账号 {acc['id']} 的 PROXY_URL_{acc['id']} 解析失败，该账号将不使用代理")
-            acc['proxy_ready'] = False
+            log(
+                f"⚠️ 账号 {acc['id']} 的 PROXY_URL_{acc['id']} 解析失败，该账号将不使用代理"
+            )
+            acc["proxy_ready"] = False
             continue
-        outbound['tag'] = tag
+        outbound["tag"] = tag
         outbounds.append(outbound)
-        # 每个账号同时开 socks + http 入站，便于 requests / playwright 共用
-        inbounds.append({
-            'type': 'mixed', 'tag': f"in_{acc['id']}",
-            'listen': '127.0.0.1', 'listen_port': acc['port'],
-        })
-        rules.append({'inbound': [f"in_{acc['id']}"], 'outbound': tag})
-        acc['proxy_ready'] = True
+
+        inbounds.append(
+            {
+                "type": "mixed",
+                "tag": f"in_{acc['id']}",
+                "listen": "127.0.0.1",
+                "listen_port": acc["port"],
+            }
+        )
+        rules.append({"inbound": [f"in_{acc['id']}"], "outbound": tag})
+        acc["proxy_ready"] = True
 
     if not inbounds:
         return
 
     config = {
-        'log': {'level': 'fatal', 'timestamp': True},
-        'inbounds': inbounds,
-        'outbounds': outbounds + [{'type': 'direct', 'tag': 'direct'}],
-        'route': {'rules': rules},
+        "log": {"level": "fatal", "timestamp": True},
+        "inbounds": inbounds,
+        "outbounds": outbounds + [{"type": "direct", "tag": "direct"}],
+        "route": {"rules": rules},
     }
     try:
-        with open(SINGBOX_CONFIG, 'w', encoding='utf-8') as f:
+        with open(SINGBOX_CONFIG, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log(f"❌ 写入 sing-box 配置失败: {e}")
         for acc in proxied:
-            acc['proxy_ready'] = False
+            acc["proxy_ready"] = False
         return
 
     try:
         SINGBOX_PROCESS = subprocess.Popen(
-            [SINGBOX_BIN, 'run', '-c', SINGBOX_CONFIG],
-            stdout=open(SINGBOX_LOG, 'a'), stderr=subprocess.STDOUT,
+            [SINGBOX_BIN, "run", "-c", SINGBOX_CONFIG],
+            stdout=open(SINGBOX_LOG, "a"),
+            stderr=subprocess.STDOUT,
             start_new_session=True,
         )
         time.sleep(3)
@@ -471,13 +523,16 @@ def start_singbox(accounts):
             log("❌ sing-box 启动后立即退出，请查看 singbox.log")
             SINGBOX_PROCESS = None
             for acc in proxied:
-                acc['proxy_ready'] = False
+                acc["proxy_ready"] = False
             return
-        log(f"✅ sing-box 已启动，代理端口: {', '.join(str(a['port']) for a in proxied if a.get('proxy_ready'))}")
+        log(
+            f"✅ sing-box 已启动，代理端口: {', '.join(str(a['port']) for a in proxied if a.get('proxy_ready'))}"
+        )
     except Exception as e:
         log(f"❌ 启动 sing-box 失败: {e}")
         for acc in proxied:
-            acc['proxy_ready'] = False
+            acc["proxy_ready"] = False
+
 
 def stop_singbox():
     global SINGBOX_PROCESS
@@ -498,13 +553,16 @@ def stop_singbox():
     except Exception:
         pass
 
+
 def get_current_ip(proxy_server=None):
-    """获取当前出口IP"""
-    use_proxy = bool(proxy_server) and (IS_PROXY or proxy_server.startswith('http://127.0.0.1'))
+
+    use_proxy = bool(proxy_server) and (
+        IS_PROXY or proxy_server.startswith("http://127.0.0.1")
+    )
     proxies = {"http": proxy_server, "https": proxy_server} if use_proxy else None
     try:
         resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
-        # log(f"请求出口IP完成, status={resp.status_code}")
+
         if resp.status_code == 200:
             return resp.text.strip()
         return "获取失败"
@@ -512,36 +570,53 @@ def get_current_ip(proxy_server=None):
         log(f"❌ 获取出口IP失败: {e}")
         return "获取失败"
 
-# =========================================================
-# 状态文件（state.json：记录每个账号的到期时间，用于跳过未到期账号）
-# =========================================================
 
 def load_state():
     try:
         if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else {}
     except Exception as e:
         log(f"⚠️ 读取 state.json 失败: {e}")
     return {}
 
+
 def save_state(state):
     try:
-        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
         log(f"💾 已更新 state.json")
     except Exception as e:
         log(f"⚠️ 写入 state.json 失败: {e}")
 
-MONTHS = {m: i + 1 for i, m in enumerate(
-    ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'])}
+
+MONTHS = {
+    m: i + 1
+    for i, m in enumerate(
+        [
+            "jan",
+            "feb",
+            "mar",
+            "apr",
+            "may",
+            "jun",
+            "jul",
+            "aug",
+            "sep",
+            "oct",
+            "nov",
+            "dec",
+        ]
+    )
+}
+
 
 def parse_due_date(text):
-    """把 '27 Oct 2026' 之类的到期时间转成时间戳，便于判断剩余时间"""
+
     if not text:
         return 0
-    match = re.search(r'(\d{1,2})\s+([A-Za-z]{3,})\s+(\d{4})', str(text))
+    match = re.search(r"(\d{1,2})\s+([A-Za-z]{3,})\s+(\d{4})", str(text))
     if not match:
         return 0
     day, mon, year = match.group(1), match.group(2)[:3].lower(), match.group(3)
@@ -549,17 +624,29 @@ def parse_due_date(text):
         return 0
     try:
         import calendar
-        return int(calendar.timegm(time.strptime(
-            f"{year}-{MONTHS[mon]:02d}-{int(day):02d} 00:00:00", "%Y-%m-%d %H:%M:%S")))
+
+        return int(
+            calendar.timegm(
+                time.strptime(
+                    f"{year}-{MONTHS[mon]:02d}-{int(day):02d} 00:00:00",
+                    "%Y-%m-%d %H:%M:%S",
+                )
+            )
+        )
     except Exception:
         return 0
 
-# =========================================================
-# 通知（Telegram / 邮件 / WxPush）
-# =========================================================
+
+def post_notification(url, payload, headers=None):
+    with requests.Session() as session:
+        session.trust_env = False
+        response = session.post(url, json=payload, headers=headers, timeout=15)
+        response.raise_for_status()
+        return response
+
 
 def send_telegram_notification(summary):
-    """发送 Telegram 汇总通知"""
+
     if not TG_TOKEN or not TG_CHAT:
         log("⚠️ Telegram 未配置，跳过通知")
         return False
@@ -569,9 +656,11 @@ def send_telegram_notification(summary):
 
     blocks = []
     for item in summary:
-        lines = [f"👤 <b>账号:</b> <code>{escape_html(item['user'])}</code>",
-                 f"🔑 <b>登录:</b> {escape_html(item['login_method'])}"]
-        if item['failed']:
+        lines = [
+            f"👤 <b>账号:</b> <code>{escape_html(item['user'])}</code>",
+            f"🔑 <b>登录:</b> {escape_html(item['login_method'])}",
+        ]
+        if item["failed"]:
             lines.append(f"❌ <b>异常:</b> {escape_html(item['status'])}")
         else:
             lines.append(f"{escape_html(item['status'])}")
@@ -580,16 +669,19 @@ def send_telegram_notification(summary):
             lines.append(f"🌐 <b>IP:</b> {escape_html(mask_ip(item['ip']))}")
         blocks.append("\n".join(lines))
 
-    text = ("☁️ <b>HidenCloud 自动续期报告</b>\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            + "\n━━━━━━━━━━━━━━━━━━\n".join(blocks)
-            + f"\n━━━━━━━━━━━━━━━━━━\n🕒 {now}")
+    text = (
+        "☁️ <b>HidenCloud 自动续期报告</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        + "\n━━━━━━━━━━━━━━━━━━\n".join(blocks)
+        + f"\n━━━━━━━━━━━━━━━━━━\n🕒 {now}"
+    )
 
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"}
     try:
-        resp = requests.post(url, json=payload, timeout=10, proxies=REQUESTS_PROXIES)
-        if resp.status_code == 200:
+        resp = post_notification(url, payload)
+        data = resp.json()
+        if isinstance(data, dict) and data.get("ok") is True:
             log("✅ Telegram 通知发送成功")
             return True
         log(f"❌ Telegram 通知失败: {resp.text}")
@@ -598,14 +690,15 @@ def send_telegram_notification(summary):
         log(f"❌ Telegram 通知异常: {e}")
         return False
 
+
 def get_smtp_config():
-    """SMTP_CONFIG 支持纯 JSON，也兼容 JS 风格的 {host:'...', port:587, user:'...', pass:'...'}"""
-    raw = (SMTP_CONFIG or '').strip()
+
+    raw = (SMTP_CONFIG or "").strip()
     if not raw:
         return None
     try:
         cfg = json.loads(raw)
-        if cfg.get('host'):
+        if cfg.get("host"):
             return cfg
     except Exception:
         pass
@@ -616,17 +709,18 @@ def get_smtp_config():
         pwd = re.search(r"""pass(?:word)?['"]?\s*:\s*['"]([^'"]+)['"]""", raw)
         if host and user and pwd:
             return {
-                'host': host.group(1),
-                'port': int(port.group(1)) if port else 587,
-                'user': user.group(1),
-                'pass': pwd.group(1),
+                "host": host.group(1),
+                "port": int(port.group(1)) if port else 587,
+                "user": user.group(1),
+                "pass": pwd.group(1),
             }
     except Exception:
         pass
     return None
 
+
 def send_email_notification(summary):
-    """SMTP 邮件汇总通知（纯 requests 实现，避免引入额外依赖）"""
+
     smtp = get_smtp_config()
     if not smtp or not EMAIL_CHAT:
         log("⏭️ 未配置 SMTP_CONFIG / EMAIL_CHAT，跳过邮件通知")
@@ -634,25 +728,37 @@ def send_email_notification(summary):
 
     blocks = []
     for item in summary:
-        color = '#e74c3c' if item['failed'] else '#2ecc71'
-        body = (f"<p style='margin:5px 0;font-size:15px;color:{color};'>"
-                f"{escape_html(item['status'])}</p>") if item['failed'] else (
-            f"<p style='margin:5px 0;font-size:15px;'>{escape_html(item['status'])}</p>"
-            f"<p style='margin:5px 0;font-size:15px;'>📅 <b>续期前:</b> {escape_html(item['old_due'])}"
-            f" → <b>续期后:</b> {escape_html(item['new_due'])}</p>"
-            f"<p style='margin:5px 0;font-size:15px;'>🌐 <b>IP:</b> {escape_html(mask_ip(item['ip']))}</p>")
+        color = "#e74c3c" if item["failed"] else "#2ecc71"
+        body = (
+            (
+                f"<p style='margin:5px 0;font-size:15px;color:{color};'>"
+                f"{escape_html(item['status'])}</p>"
+            )
+            if item["failed"]
+            else (
+                f"<p style='margin:5px 0;font-size:15px;'>{escape_html(item['status'])}</p>"
+                f"<p style='margin:5px 0;font-size:15px;'>📅 <b>续期前:</b> {escape_html(item['old_due'])}"
+                f" → <b>续期后:</b> {escape_html(item['new_due'])}</p>"
+                f"<p style='margin:5px 0;font-size:15px;'>🌐 <b>IP:</b> {escape_html(mask_ip(item['ip']))}</p>"
+            )
+        )
         blocks.append(
             f"<div style='background:#fff;padding:15px;border-radius:8px;margin-bottom:15px;"
             f"border-left:5px solid {color};box-shadow:0 2px 4px rgba(0,0,0,0.05);'>"
             f"<p style='margin:5px 0;font-size:16px;'>👤 <b>账号:</b> {escape_html(item['user'])}</p>"
             f"<p style='margin:5px 0;font-size:15px;color:#7f8c8d;'>🔑 <b>登录:</b> {escape_html(item['login_method'])}</p>"
-            f"{body}</div>")
+            f"{body}</div>"
+        )
 
-    html_body = ("<div style='font-family:Arial,sans-serif;max-width:650px;margin:auto;border:1px solid #e0e0e0;"
-                 "border-radius:10px;overflow:hidden;box-shadow:0 4px 6px rgba(0,0,0,0.1);'>"
-                 "<div style='background-color:#2c3e50;padding:20px;text-align:center;'>"
-                 "<h2 style='color:#fff;margin:0;font-size:24px;'>☁️ HidenCloud 自动续期</h2></div>"
-                 "<div style='padding:20px;background-color:#fcfcfc;'>" + "".join(blocks) + "</div></div>")
+    html_body = (
+        "<div style='font-family:Arial,sans-serif;max-width:650px;margin:auto;border:1px solid #e0e0e0;"
+        "border-radius:10px;overflow:hidden;box-shadow:0 4px 6px rgba(0,0,0,0.1);'>"
+        "<div style='background-color:#2c3e50;padding:20px;text-align:center;'>"
+        "<h2 style='color:#fff;margin:0;font-size:24px;'>☁️ HidenCloud 自动续期</h2></div>"
+        "<div style='padding:20px;background-color:#fcfcfc;'>"
+        + "".join(blocks)
+        + "</div></div>"
+    )
 
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
@@ -661,20 +767,20 @@ def send_email_notification(summary):
     import smtplib
 
     msg = MIMEMultipart()
-    msg['From'] = formataddr((str(Header('HidenCloud', 'utf-8')), smtp['user']))
-    msg['To'] = EMAIL_CHAT
-    msg['Subject'] = Header('☁️ HidenCloud 自动续期报告', 'utf-8')
-    msg.attach(MIMEText(html_body, 'html', 'utf-8'))
+    msg["From"] = formataddr((str(Header("HidenCloud", "utf-8")), smtp["user"]))
+    msg["To"] = EMAIL_CHAT
+    msg["Subject"] = Header("☁️ HidenCloud 自动续期报告", "utf-8")
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    host, port = smtp['host'], int(smtp.get('port') or 587)
+    host, port = smtp["host"], int(smtp.get("port") or 587)
     try:
         if port == 465:
             server = smtplib.SMTP_SSL(host, port, timeout=20)
         else:
             server = smtplib.SMTP(host, port, timeout=20)
             server.starttls()
-        server.login(smtp['user'], smtp['pass'])
-        server.sendmail(smtp['user'], [EMAIL_CHAT], msg.as_string())
+        server.login(smtp["user"], smtp["pass"])
+        server.sendmail(smtp["user"], [EMAIL_CHAT], msg.as_string())
         server.quit()
         log("✅ 邮件通知已发送")
         return True
@@ -682,8 +788,9 @@ def send_email_notification(summary):
         log(f"❌ 邮件通知失败: {e}")
         return False
 
+
 def send_wxpush_notification(summary):
-    """WxPush 汇总通知"""
+
     if not WXPUSH_API or not WXPUSH_TOKEN:
         log("⏭️ 未配置 WXPUSH_API / WXPUSH_TOKEN，跳过 WxPush 通知")
         return False
@@ -691,18 +798,21 @@ def send_wxpush_notification(summary):
     lines = []
     for item in summary:
         header = f"👤 {item['user']}  🔑 {item['login_method']}"
-        if item['failed']:
+        if item["failed"]:
             lines.append(f"{header}\n❌ 异常: {item['status']}")
         else:
-            lines.append(f"{header}\n{item['status']}\n📅 {item['old_due']} → {item['new_due']}")
+            lines.append(
+                f"{header}\n{item['status']}\n📅 {item['old_due']} → {item['new_due']}"
+            )
 
     try:
-        resp = requests.post(
+        resp = post_notification(
             f"{WXPUSH_API.rstrip('/')}/wxsend",
-            json={'title': '☁️ HidenCloud 自动续期报告',
-                  'content': "\n──────────────\n".join(lines)},
-            headers={'Authorization': WXPUSH_TOKEN, 'Content-Type': 'application/json'},
-            timeout=15, proxies=REQUESTS_PROXIES,
+            payload={
+                "title": "☁️ HidenCloud 自动续期报告",
+                "content": redact_sensitive_text("\n──────────────\n".join(lines)),
+            },
+            headers={"Authorization": WXPUSH_TOKEN, "Content-Type": "application/json"},
         )
         log(f"✅ WxPush 通知已发送: {resp.status_code}")
         return True
@@ -710,28 +820,24 @@ def send_wxpush_notification(summary):
         log(f"❌ WxPush 通知失败: {e}")
         return False
 
+
 def send_notifications(summary):
     send_telegram_notification(summary)
     send_email_notification(summary)
     send_wxpush_notification(summary)
 
-# =========================================================
-# 以下为原始登录 / 续期逻辑（保持完整不变，仅截图路径按账号归档）
-# =========================================================
 
 STEALTH_JS = """
-// 注意：使用真实 Chrome（channel="chrome"）时不要覆盖 window.chrome，
-// 否则会丢失 app/csi/loadTimes 等真实特征，反而更容易被 Cloudflare 识别。
 try {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 } catch (e) {}
 """
 
+
 def _get_turnstile_token(page):
-    """读取 Turnstile 验证通过后生成的响应 token，未通过时返回 None"""
+
     try:
-        return page.evaluate(
-            """
+        return page.evaluate("""
             () => {
                 try {
                     if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
@@ -752,19 +858,19 @@ def _get_turnstile_token(page):
                 }
                 return null;
             }
-            """
-        )
+            """)
     except Exception:
         return None
 
+
 def _find_visible_cf_frames(page):
-    """返回当前可见且有实际尺寸的 Cloudflare 挑战/Turnstile iframe（后出现的排最后，弹窗内的通常在最后）"""
+
     result = []
     try:
         for handle in page.query_selector_all(CF_IFRAME_SELECTOR):
             try:
                 box = handle.bounding_box()
-                if box and box['width'] > 10 and box['height'] > 10:
+                if box and box["width"] > 10 and box["height"] > 10:
                     result.append(handle)
             except Exception:
                 continue
@@ -772,10 +878,11 @@ def _find_visible_cf_frames(page):
         pass
     return result
 
+
 def _cf_checkbox_visible(page):
-    """任意 Cloudflare 框架内（含嵌套 iframe）当前是否可见复选框"""
+
     for frame in page.frames:
-        if 'challenges.cloudflare.com' not in (frame.url or ''):
+        if "challenges.cloudflare.com" not in (frame.url or ""):
             continue
         try:
             if frame.locator('input[type="checkbox"]:visible').count() > 0:
@@ -784,17 +891,18 @@ def _cf_checkbox_visible(page):
             continue
     return False
 
+
 def _click_cf_checkbox(page, frame_el=None):
-    """点击 Cloudflare/Turnstile 复选框：先试框架内元素（含嵌套 iframe），失败退化为坐标点击"""
+
     for frame in page.frames:
-        if 'challenges.cloudflare.com' not in (frame.url or ''):
+        if "challenges.cloudflare.com" not in (frame.url or ""):
             continue
         try:
             frame.locator('input[type="checkbox"]').first.click(timeout=2500)
             return True
         except Exception:
             continue
-    # 退化方案：复选框通常位于 iframe 左侧（x≈20~35，垂直居中），用真实鼠标事件点击
+
     if frame_el is None:
         return False
     try:
@@ -805,8 +913,8 @@ def _click_cf_checkbox(page, frame_el=None):
         box = frame_el.bounding_box()
         if not box:
             return False
-        x = box['x'] + random.uniform(18, 34)
-        y = box['y'] + box['height'] / 2 + random.uniform(-4, 4)
+        x = box["x"] + random.uniform(18, 34)
+        y = box["y"] + box["height"] / 2 + random.uniform(-4, 4)
         page.mouse.move(x - random.uniform(30, 60), y + random.uniform(-8, 8))
         time.sleep(random.uniform(0.15, 0.4))
         page.mouse.move(x, y)
@@ -818,43 +926,55 @@ def _click_cf_checkbox(page, frame_el=None):
     except Exception:
         return False
 
-SECURITY_TITLE_HINTS = ('security verification', 'just a moment', 'attention required', 'checking your browser', '请稍候', 'please wait', 'one more step')
+
+SECURITY_TITLE_HINTS = (
+    "security verification",
+    "just a moment",
+    "attention required",
+    "checking your browser",
+    "请稍候",
+    "please wait",
+    "one more step",
+)
+
 
 def _is_security_check_page(page):
     try:
-        title = (page.title() or '').lower()
+        title = (page.title() or "").lower()
         if any(h in title for h in SECURITY_TITLE_HINTS):
             return True
     except Exception:
         return True
     try:
-        return page.evaluate(
-            """
+        return page.evaluate("""
             () => {
                 const t = document.body ? document.body.innerText.slice(0, 5000).toLowerCase() : '';
                 return t.includes('verify you are human') || t.includes('checking your browser')
                     || t.includes('security verification');
             }
-            """
-        )
+            """)
     except Exception:
         return True
 
+
 def _has_interstitial_iframe(page):
-    """是否存在整页挑战 iframe（排除弹窗内 /turnstile/ 组件 iframe，那由 solve_modal_turnstile 处理）"""
+
     try:
         for handle in page.query_selector_all(CF_IFRAME_SELECTOR):
-            if '/turnstile/' not in (handle.get_attribute('src') or ''):
+            if "/turnstile/" not in (handle.get_attribute("src") or ""):
                 return True
     except Exception:
         pass
     return False
 
+
 def _click_security_submit(page):
-    """安全验证页 token 已生成但仍停在验证页时，尝试点击确认/继续按钮"""
-    for text in ('Verify', 'Continue', 'Submit', 'Proceed', '验证'):
+
+    for text in ("Verify", "Continue", "Submit", "Proceed", "验证"):
         try:
-            btn = page.locator(f'button:has-text("{text}"):visible, input[type="submit"]:visible').first
+            btn = page.locator(
+                f'button:has-text("{text}"):visible, input[type="submit"]:visible'
+            ).first
             if btn.count() > 0:
                 btn.click(timeout=3000)
                 log(f"🖱️ 已点击安全验证页的确认按钮（{text}）...")
@@ -863,8 +983,9 @@ def _click_security_submit(page):
             continue
     return False
 
+
 def _dump_security_page(page):
-    """调试：采集安全验证页的关键结构（iframe/按钮/正文），便于排查"""
+
     try:
         screenshot(page, "security_page")
         srcs = page.evaluate(
@@ -874,11 +995,14 @@ def _dump_security_page(page):
         buttons = page.evaluate(
             "() => Array.from(document.querySelectorAll('button, input[type=submit], a.btn')).map(b => (b.innerText || b.value || '').trim()).filter(t => t && t.length < 40)"
         )
-        # log(f"🔍 验证页按钮: {buttons}")
-        body = page.evaluate("() => document.body ? document.body.innerText.slice(0, 200) : ''")
-        # log(f"🔍 验证页正文: {body}")
+
+        body = page.evaluate(
+            "() => document.body ? document.body.innerText.slice(0, 200) : ''"
+        )
+
     except Exception as e:
         log(f"🔍 验证页信息采集失败: {e}")
+
 
 def handle_cloudflare(page, timeout=240):
     def challenge_active():
@@ -904,13 +1028,17 @@ def handle_cloudflare(page, timeout=240):
     while time.time() - start_time < effective_timeout:
         if not challenge_active():
             clear_rounds += 1
-            if clear_rounds >= 2: 
-                # log("✅ Turnstile 安全验证通过！")
+            if clear_rounds >= 2:
+
                 return True
             time.sleep(1)
             continue
         clear_rounds = 0
-        if not manual_hinted and timeout > 60 and time.time() - start_time > timeout - 30:
+        if (
+            not manual_hinted
+            and timeout > 60
+            and time.time() - start_time > timeout - 30
+        ):
             log("🤝 自动点击未能通过验证，脚本会继续等待...")
             manual_hinted = True
         if time.time() - last_click > 6:
@@ -922,7 +1050,7 @@ def handle_cloudflare(page, timeout=240):
                     time.sleep(random.uniform(3, 5))
                     continue
             elif _get_turnstile_token(page) and _is_security_check_page(page):
-                # token 已生成但页面仍停在验证页：可能需要手动点确认按钮
+
                 if _click_security_submit(page):
                     last_click = time.time()
                     time.sleep(random.uniform(2, 4))
@@ -935,6 +1063,7 @@ def handle_cloudflare(page, timeout=240):
         pass
     return False
 
+
 def solve_modal_turnstile(page, timeout=90):
     log("🛡️ 开始处理 Turnstile 验证...")
     start = time.time()
@@ -942,13 +1071,13 @@ def solve_modal_turnstile(page, timeout=90):
     clicks = 0
     no_frame_seconds = 0
     while time.time() - start < timeout:
-        # 1) token 已生成 → 验证通过
+
         if _get_turnstile_token(page):
             log("✅ Turnstile 验证通过！")
             return True
         frames = _find_visible_cf_frames(page)
         if not frames:
-            # 弹窗里还没有 Turnstile（可能没加载出来），等 20 秒后视为无需验证
+
             no_frame_seconds += 1
             if no_frame_seconds >= 20 and clicks == 0:
                 log("ℹ️ 未检测到 Turnstile 验证框，无需验证。")
@@ -956,13 +1085,17 @@ def solve_modal_turnstile(page, timeout=90):
             time.sleep(1)
             continue
         no_frame_seconds = 0
-        # 2) 已点击过且框内复选框消失（变成对勾）→ 视为通过（token 字段名可能被站点自定义时兜底）
-        if clicks > 0 and time.time() - last_click > 4 and not _cf_checkbox_visible(page):
+
+        if (
+            clicks > 0
+            and time.time() - last_click > 4
+            and not _cf_checkbox_visible(page)
+        ):
             time.sleep(2)
             if not _cf_checkbox_visible(page):
                 log("✅ Turnstile 复选框已消失，视为验证通过！")
                 return True
-        # 3) 存在可见验证框时，每隔几秒重试点击
+
         if time.time() - last_click > 6 and _cf_checkbox_visible(page):
             log(f"🖱️ 点击 Turnstile 复选框（第 {clicks + 1} 次）...")
             if _click_cf_checkbox(page, frames[-1]):
@@ -970,7 +1103,7 @@ def solve_modal_turnstile(page, timeout=90):
                 last_click = time.time()
                 time.sleep(random.uniform(3, 5))
                 continue
-        # 4) 长时间检测不到可点击的复选框时，直接坐标点击兜底
+
         if clicks == 0 and time.time() - start > 20 and time.time() - last_click > 6:
             if _click_cf_checkbox(page, frames[-1]):
                 clicks += 1
@@ -984,27 +1117,34 @@ def solve_modal_turnstile(page, timeout=90):
     log("❌ Turnstile 验证超时。")
     return False
 
+
 def open_browser(p, proxy_server=None):
-    """启动浏览器，返回 (browser, page)。优先 patchright（反检测内核），未安装则退回原生 playwright。"""
+
     proxy_arg = {"server": proxy_server} if proxy_server else None
     if USING_PATCHRIGHT:
         browser = p.chromium.launch(
             channel="chrome",
             headless=False,
-            args=['--disable-infobars'],
+            args=["--disable-infobars"],
             proxy=proxy_arg,
         )
         ctx = browser.new_context(viewport=None, proxy=proxy_arg)
         page = ctx.new_page()
         return browser, page
-    log("⚠️ 未安装 patchright（建议 pip install patchright），退回原生 playwright，过 Cloudflare 能力较弱")
+    log(
+        "⚠️ 未安装 patchright（建议 pip install patchright），退回原生 playwright，过 Cloudflare 能力较弱"
+    )
     browser = p.chromium.launch(
         channel="chrome",
         headless=False,
-        args=['--no-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars']
+        args=[
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+        ],
     )
     ctx = browser.new_context(
-        viewport={'width': 1920, 'height': 1080},
+        viewport={"width": 1920, "height": 1080},
         user_agent=DEFAULT_UA,
         proxy=proxy_arg,
     )
@@ -1012,21 +1152,23 @@ def open_browser(p, proxy_server=None):
     page.add_init_script(STEALTH_JS)
     return browser, page
 
+
 def _is_logged_in(page):
-    """是否真正处于登录后的控制台状态（防止把官网首页/验证页/登录页误判为登录成功）"""
+
     try:
-        url = page.url or ''
-        if 'dash.hidencloud.com' not in url:
+        url = page.url or ""
+        if "dash.hidencloud.com" not in url:
             return False
-        if 'auth/login' in url or _is_security_check_page(page):
+        if "auth/login" in url or _is_security_check_page(page):
             return False
         return True
     except Exception:
         return False
 
+
 def login(page):
     global LOGIN_METHOD
-    # 账号密码登录（cookie 有效期短，已完全弃用免密登录）
+
     if not EMAIL or not PASSWORD:
         log("❌ 缺少账号密码，无法登录。")
         return False
@@ -1035,13 +1177,15 @@ def login(page):
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page, timeout=240)
         time.sleep(2)
-        
+
         log("⌨️ 输入账号密码...")
-        # 真实表单字段：input[name="username"]（可填邮箱或用户名）/ input[name="password"]
-        user_input = page.locator('input[name="username"], input[name="email"], input[type="email"]').first
+
+        user_input = page.locator(
+            'input[name="username"], input[name="email"], input[type="email"]'
+        ).first
         pwd_input = page.locator('input[name="password"], input[type="password"]').first
         try:
-            # 登录表单要等安全验证页通过后才会渲染
+
             user_input.wait_for(state="visible", timeout=30000)
         except Exception:
             handle_cloudflare(page, timeout=120)
@@ -1051,15 +1195,16 @@ def login(page):
         time.sleep(0.5)
         handle_cloudflare(page, timeout=60)
 
-        # 登录表单自带 Turnstile，提交前先等它的 token
         if not solve_modal_turnstile(page, timeout=90):
             log("⚠️ 登录表单的 Turnstile 未确认通过，仍将尝试提交...")
-        
+
         log("🖱️ 点击登录按钮提交...")
         try:
             page.click('button[type="submit"]', timeout=8000)
         except Exception:
-            page.locator('button:has-text("Sign in"), button:has-text("登录")').first.click(timeout=10000)
+            page.locator(
+                'button:has-text("Sign in"), button:has-text("登录")'
+            ).first.click(timeout=10000)
         time.sleep(3)
         handle_cloudflare(page, timeout=240)
         nav_start = time.time()
@@ -1093,11 +1238,14 @@ def login(page):
         screenshot(page, "login_fail")
         return False
 
+
 def get_server_id(page):
     try:
-        if 'dash.hidencloud.com' not in page.url:
+        if "dash.hidencloud.com" not in page.url:
             log("⚠️ 当前不在控制台页面，先跳转 dashboard...")
-            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+            page.goto(
+                f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000
+            )
             handle_cloudflare(page)
             time.sleep(2)
         handle_cloudflare(page)
@@ -1105,18 +1253,16 @@ def get_server_id(page):
         html = page.content()
         log(f"📝 页面长度: {len(html)}, URL: {page.url}")
 
-        # 方案1: 从 href 链接中提取 /service/数字/manage
-        matches = re.findall(r'/service/(\d+)/manage', html)
+        matches = re.findall(r"/service/(\d+)/manage", html)
         if matches:
             server_id = matches[0]
-            log(f"✅ 从链接中获取到 Server ID: {server_id}")
+            log(f"✅ 从链接中获取到 Server ID: {mask_server_id(server_id)}")
             return server_id
 
-        # 方案2: 从 span 标签中提取 #数字 (如 "Free Server #218079")；过滤全 0 的误匹配
-        matches = [m for m in re.findall(r'#(\d{4,})', html) if set(m) != {'0'}]
+        matches = [m for m in re.findall(r"#(\d{4,})", html) if set(m) != {"0"}]
         if matches:
             server_id = matches[0]
-            log(f"✅ 从文本 #号中获取到 Server ID: {server_id}")
+            log(f"✅ 从文本 #号中获取到 Server ID: {mask_server_id(server_id)}")
             return server_id
 
         log("❌ 所有 URL 均未找到 Server ID")
@@ -1125,6 +1271,7 @@ def get_server_id(page):
         log(f"❌ 获取 Server ID 失败: {e}")
         screenshot(page, "server_id_error")
         return None
+
 
 def get_due_date(page):
     try:
@@ -1147,6 +1294,7 @@ def get_due_date(page):
         log(f"❌ 获取Due Date失败: {e}")
     return "未知"
 
+
 def renew_service(page):
 
     try:
@@ -1167,13 +1315,15 @@ def renew_service(page):
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
                 renew_btn.click()
 
-                # 等待一小段时间，检测是否出现“未到续期时间”弹窗
                 time.sleep(3)
                 page_text = page.locator("body").inner_text()
-                if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
+                if (
+                    "Renewal Restricted" in page_text
+                    or "can only renew" in page_text.lower()
+                ):
                     log("⚠️ 未到续期时间，无法续期。")
                     screenshot(page, "renew_not_allowed")
-                    return "NOT_TIME"   # 特殊状态
+                    return "NOT_TIME"
 
                 log("🖲️ 等待弹窗出现...")
                 try:
@@ -1192,13 +1342,11 @@ def renew_service(page):
             screenshot(page, "renew_modal_failed")
             return False
 
-        # 弹窗内先完成 Turnstile 人机验证，再提交
         handle_cloudflare(page, timeout=60)
         if not solve_modal_turnstile(page, timeout=90):
             log("⚠️ Turnstile 未确认通过，仍将尝试提交...")
             screenshot(page, "turnstile_timeout")
 
-        # 点击 Create Invoice；未跳转说明验证未通过/已过期，重做验证后再试
         new_invoice_url = None
         for attempt in range(6):
             log(f"🖱️ 点击 'Create Invoice'（第 {attempt + 1} 次）...")
@@ -1216,7 +1364,7 @@ def renew_service(page):
                     new_invoice_url = page.url
                     log(f"🎉 页面已跳转: {new_invoice_url}")
                     break
-                # 出现整页 Cloudflare 拦截/安全验证页时先处理（弹窗内的 Turnstile 组件交给 solve_modal_turnstile）
+
                 if _has_interstitial_iframe(page) or _is_security_check_page(page):
                     log("⚠️ 遇到整页拦截，尝试处理...")
                     handle_cloudflare(page, timeout=60)
@@ -1237,14 +1385,15 @@ def renew_service(page):
         handle_cloudflare(page)
 
         log("🔎 查找 Pay 按钮...")
-        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+        pay_btn = page.locator(
+            'a:has-text("Pay"):visible, button:has-text("Pay"):visible'
+        ).first
         pay_btn.wait_for(state="visible", timeout=30000)
         pay_btn.click()
         log("✅ Pay 按钮已点击")
 
-        # 等待支付确认页面或跳转回服务页
         time.sleep(5)
-        # 返回服务管理页面以获取新的到期时间
+
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
         return True
@@ -1254,122 +1403,129 @@ def renew_service(page):
         screenshot(page, "renew_error")
         return False
 
-# =========================================================
-# 单账号执行（浏览器在账号之间复用，每个账号独立 context，环境隔离）
-# =========================================================
 
 def run_single_account(p, acc, state):
-    """处理单个账号，返回汇总用结果字典"""
-    global EMAIL, PASSWORD, CURRENT_ACCOUNT, SERVICE_URL, REQUESTS_PROXIES, IS_PROXY, PROXY_SERVER, LOGIN_METHOD
 
-    EMAIL        = acc.get('username') or ""
-    PASSWORD     = acc.get('password') or ""
+    global EMAIL, PASSWORD, CURRENT_ACCOUNT, SERVICE_URL, IS_PROXY, PROXY_SERVER, LOGIN_METHOD
+
+    EMAIL = acc.get("username") or ""
+    PASSWORD = acc.get("password") or ""
     CURRENT_ACCOUNT = acc
     LOGIN_METHOD = "未知"
 
     masked = mask_email(EMAIL) if EMAIL else f"账号{acc['id']}"
     result = {
-        'id': acc['id'], 'user': masked, 'login_method': '未登录',
-        'status': '❌ 未执行', 'old_due': '未知', 'new_due': '未知',
-        'ip': '未知', 'failed': True,
+        "id": acc["id"],
+        "user": masked,
+        "login_method": "未登录",
+        "status": "❌ 未执行",
+        "old_due": "未知",
+        "new_due": "未知",
+        "ip": "未知",
+        "failed": True,
     }
 
     log("===========================================")
     log(f"▶ 开始处理账号: {masked} (ID: {acc['id']})")
 
-    # 强制使用该账号自己的代理，绝不回落到其它账号或全局代理
-    if not acc.get('proxy_url'):
-        log(f"🚫 账号 {acc['id']} 未配置 PROXY_URL_{acc['id']}，为满足环境隔离原则，放弃执行！")
-        result['status'] = f"❌ 失败 (缺少 PROXY_URL_{acc['id']})"
+    if not acc.get("proxy_url"):
+        log(
+            f"🚫 账号 {acc['id']} 未配置 PROXY_URL_{acc['id']}，为满足环境隔离原则，放弃执行！"
+        )
+        result["status"] = f"❌ 失败 (缺少 PROXY_URL_{acc['id']})"
         return result
-    if not acc.get('proxy_ready'):
-        log(f"🚫 PROXY_URL_{acc['id']} 不可用，放弃执行当前账号（不允许改用其它代理）！")
-        result['status'] = '❌ 失败 (代理失效)'
+    if not acc.get("proxy_ready"):
+        log(
+            f"🚫 PROXY_URL_{acc['id']} 不可用，放弃执行当前账号（不允许改用其它代理）！"
+        )
+        result["status"] = "❌ 失败 (代理失效)"
         return result
 
     account_proxy = f"http://127.0.0.1:{acc['port']}"
-    log(f"🌐 使用账号 {acc['id']} 专属代理: PROXY_URL_{acc['id']} → 127.0.0.1:{acc['port']}")
+    log(
+        f"🌐 使用账号 {acc['id']} 专属代理: PROXY_URL_{acc['id']} → 127.0.0.1:{acc['port']}"
+    )
     IS_PROXY = True
     PROXY_SERVER = account_proxy
-    REQUESTS_PROXIES = {"http": PROXY_SERVER, "https": PROXY_SERVER}
 
     try:
         log(f"⚙️ 代理已启用: {PROXY_SERVER}")
 
-        # 获取当前出口ip
         current_ip = get_current_ip(PROXY_SERVER)
-        log(f"🎯 当前出口IP: {current_ip}")
-        result['ip'] = current_ip
+        log(f"🎯 当前出口IP: {mask_ip(current_ip)}")
+        result["ip"] = current_ip
 
-        log("🚀 启动反检测内核浏览器...") # 使用patchright 反检测内核
+        log("🚀 启动反检测内核浏览器...")
         browser, page = open_browser(p, account_proxy)
 
         try:
             if not login(page):
                 log("❌ 登录失败，跳过该账号。")
-                result['status'] = '❌ 登录失败'
+                result["status"] = "❌ 登录失败"
                 return result
 
-            # 登录方式在 login() 内部按实际生效的分支写入
-            result['login_method'] = LOGIN_METHOD
+            result["login_method"] = LOGIN_METHOD
 
-            # 登录成功后，自动获取 Server ID
             server_id = get_server_id(page)
             if not server_id:
                 log("❌ 无法获取 Server ID，跳过该账号。")
-                result['status'] = '❌ 无法获取 Server ID'
+                result["status"] = "❌ 无法获取 Server ID"
                 return result
             SERVICE_URL = f"{BASE_URL}/service/{server_id}/manage"
 
-            # 获取旧到期时间
             old_due = get_due_date(page)
             log(f"📆 续费前到期时间：{old_due}")
-            result['old_due'] = old_due
+            result["old_due"] = old_due
 
-            # 记录 service id 与到期时间，供下次跳过判断
             acc_state = state.setdefault(f"ACCOUNT_{acc['id']}", {})
-            acc_state['service_id'] = server_id
-            acc_state['due_date'] = old_due
-            acc_state['due_ts'] = parse_due_date(old_due) or acc_state.get('due_ts', 0)
-            acc_state['updated_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+            acc_state["service_id"] = server_id
+            acc_state["due_date"] = old_due
+            acc_state["due_ts"] = parse_due_date(old_due) or acc_state.get("due_ts", 0)
+            acc_state["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
-            # 二次判断：拿到真实到期时间后仍满足续期条件才继续（工作流已预筛过一轮）
-            remaining = acc_state['due_ts'] - int(time.time()) if acc_state.get('due_ts') else None
+            remaining = (
+                acc_state["due_ts"] - int(time.time())
+                if acc_state.get("due_ts")
+                else None
+            )
             if remaining is not None and remaining > DUE_WITHIN_HOURS * 3600:
-                log(f"⏭️ 距离到期还有 {remaining / 3600:.1f} 小时（>{DUE_WITHIN_HOURS:g}H），无需续期。")
-                result['status'] = '⏭️ 未到期，已跳过'
-                result['new_due'] = old_due
-                result['failed'] = False
+                log(
+                    f"⏭️ 距离到期还有 {remaining / 3600:.1f} 小时（>{DUE_WITHIN_HOURS:g}H），无需续期。"
+                )
+                result["status"] = "⏭️ 未到期，已跳过"
+                result["new_due"] = old_due
+                result["failed"] = False
                 return result
 
-            # 执行续费
             renew_result = renew_service(page)
 
             new_due = old_due
             if renew_result == "NOT_TIME":
                 log("⏳ 未到续期时间，目前无法续期")
-                result['status'] = "⏳ 未到续期时间"
-                result['failed'] = False
-                acc_state['last_result'] = 'not_time'
-                acc_state.pop('retry_at', None)
+                result["status"] = "⏳ 未到续期时间"
+                result["failed"] = False
+                acc_state["last_result"] = "not_time"
+                acc_state.pop("retry_at", None)
             elif renew_result is False:
                 log("❌ 续费失败。")
-                result['status'] = "❌ 续期失败"
-                result['failed'] = True
-                # 记下退避时间，让下次运行仍会重试，避免失败后被一直跳过
-                acc_state['last_result'] = 'failed'
-                acc_state['retry_at'] = int(time.time()) + RETRY_AFTER_HOURS * 3600
-            else:  # renew_result is True
+                result["status"] = "❌ 续期失败"
+                result["failed"] = True
+
+                acc_state["last_result"] = "failed"
+                acc_state["retry_at"] = int(time.time()) + RETRY_AFTER_HOURS * 3600
+            else:
                 new_due = get_due_date(page)
                 log(f"📆 续费后到期时间：{new_due}")
-                result['status'] = "✅ 续期成功"
-                result['failed'] = False
-                acc_state['due_date'] = new_due
-                acc_state['due_ts'] = parse_due_date(new_due) or acc_state.get('due_ts', 0)
-                acc_state['last_result'] = 'success'
-                acc_state.pop('retry_at', None)
+                result["status"] = "✅ 续期成功"
+                result["failed"] = False
+                acc_state["due_date"] = new_due
+                acc_state["due_ts"] = parse_due_date(new_due) or acc_state.get(
+                    "due_ts", 0
+                )
+                acc_state["last_result"] = "success"
+                acc_state.pop("retry_at", None)
 
-            result['new_due'] = new_due
+            result["new_due"] = new_due
 
             return result
         finally:
@@ -1379,11 +1535,12 @@ def run_single_account(p, acc, state):
                 pass
     except Exception as e:
         log(f"❌ 浏览器启动出错: {e}")
-        result['status'] = f"❌ 异常: {e}"
+        result["status"] = f"❌ 异常: {e}"
         acc_state = state.setdefault(f"ACCOUNT_{acc['id']}", {})
-        acc_state['last_result'] = 'failed'
-        acc_state['retry_at'] = int(time.time()) + RETRY_AFTER_HOURS * 3600
+        acc_state["last_result"] = "failed"
+        acc_state["retry_at"] = int(time.time()) + RETRY_AFTER_HOURS * 3600
         return result
+
 
 def main():
     global SERVICE_URL
@@ -1391,17 +1548,17 @@ def main():
     state = load_state()
     accounts = get_accounts()
 
-    # 检查必要环境变量
     log(f"🔍 凭证检测: 共发现 {len(accounts)} 个账号")
     for acc in accounts:
-        log(f"   • 账号 {acc['id']}: EMAIL={'已配置' if acc['username'] else '未配置'}, "
+        log(
+            f"   • 账号 {acc['id']}: EMAIL={'已配置' if acc['username'] else '未配置'}, "
             f"PASSWORD={'已配置' if acc['password'] else '未配置'}, "
-            f"PROXY_URL_{acc['id']}={'已配置' if acc.get('proxy_url') else '未配置'}")
+            f"PROXY_URL_{acc['id']}={'已配置' if acc.get('proxy_url') else '未配置'}"
+        )
     if not accounts:
         log("❌ 未检测到任何 HIDEN_ACCOUNT_X 环境变量（也没有 EMAIL/PASSWORD），退出。")
         sys.exit(1)
 
-    # 环境隔离硬性校验：每个账号必须有独立代理，且禁止多账号共用同一代理
     problems = validate_proxy_isolation(accounts)
     if problems:
         log("🚫 环境隔离校验未通过，为保证账号安全，本次不执行任何账号：")
@@ -1410,15 +1567,13 @@ def main():
         sys.exit(1)
     log(f"✅ 环境隔离校验通过：{len(accounts)} 个账号各自使用独立代理")
 
-    # 按 state.json 筛选出真正需要续期的账号，未到期的不运行
     pending_ids = accounts_to_renew(accounts, state)
     if not pending_ids:
         log("⏭️ 所有账号均未到期，本次无需运行（不启动浏览器、不执行续期）。")
         sys.exit(0)
-    pending = [a for a in accounts if a['id'] in pending_ids]
+    pending = [a for a in accounts if a["id"] in pending_ids]
     log(f"🎯 本次需要续期的账号: {', '.join(a['id'] for a in pending)}")
 
-    # 只为待续期账号启动各自的 sing-box 本地代理
     start_singbox(pending)
 
     summary = []
@@ -1431,27 +1586,34 @@ def main():
                 except Exception as e:
                     log(f"❌ 账号 {acc['id']} 处理异常: {e}")
                     result = {
-                        'id': acc['id'], 'user': mask_email(acc.get('username', '')),
-                        'login_method': '未知', 'status': f"❌ 异常: {e}",
-                        'old_due': '未知', 'new_due': '未知', 'ip': '未知', 'failed': True,
+                        "id": acc["id"],
+                        "user": mask_email(acc.get("username", "")),
+                        "login_method": "未知",
+                        "status": f"❌ 异常: {e}",
+                        "old_due": "未知",
+                        "new_due": "未知",
+                        "ip": "未知",
+                        "failed": True,
                     }
                 summary.append(result)
-                if result.get('failed'):
+                if result.get("failed"):
                     exit_code = 1
         finally:
             stop_singbox()
 
     save_state(state)
 
-    # 发送通知（Telegram / 邮件 / WxPush）
     send_notifications(summary)
 
     log("═══════════ 运行汇总 ═══════════")
     for item in summary:
-        log(f"账号 {item['id']} ({item['user']}): {item['status']} | {item['old_due']} → {item['new_due']}")
+        log(
+            f"账号 {item['id']} ({item['user']}): {item['status']} | {item['old_due']} → {item['new_due']}"
+        )
     log("════════════════════════════════")
 
     sys.exit(exit_code)
+
 
 if __name__ == "__main__":
     main()
