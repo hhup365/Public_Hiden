@@ -834,6 +834,122 @@ try {
 """
 
 
+CMP_SELECTOR = (
+    '#ncmp__tool, [id^="ncmp__"], .ncmp__banner, .ncmp__banner-inner, '
+    "#onetrust-banner-sdk, .cc-window, .cookie-consent, #cookie-banner"
+)
+
+CMP_ACCEPT_TEXTS = (
+    "Accept all",
+    "Accept cookies",
+    "Accept",
+    "I agree",
+    "Allow all",
+    "Agree",
+    "Got it",
+    "OK",
+    "全部接受",
+    "接受全部",
+    "同意全部",
+    "同意",
+    "接受",
+    "我知道了",
+)
+
+
+def dismiss_cookie_banner(page, timeout=2500):
+
+    try:
+        banner = page.locator(CMP_SELECTOR)
+        if banner.count() == 0:
+            return True
+
+        for text in CMP_ACCEPT_TEXTS:
+            try:
+                btn = banner.locator(
+                    f'button:has-text("{text}"), a:has-text("{text}")'
+                ).first
+                if btn.count() == 0 or not btn.is_visible():
+                    continue
+                btn.click(timeout=timeout)
+                time.sleep(0.4)
+                log(f"🍪 已点击 Cookie 横幅的接受按钮（{text}）")
+                break
+            except Exception:
+                continue
+
+        if banner.count() > 0:
+            removed = page.evaluate(
+                """(sel) => {
+                    let n = 0;
+                    document.querySelectorAll(sel).forEach((el) => { el.remove(); n++; });
+                    return n;
+                }""",
+                CMP_SELECTOR,
+            )
+            if removed:
+                log(f"🍪 已移除残留的 Cookie 横幅节点（{removed} 个）")
+            time.sleep(0.3)
+
+        return banner.count() == 0
+    except Exception as e:
+        log(f"⚠️ 处理 Cookie 横幅异常: {e}")
+        return False
+
+
+def safe_click(page, locator, desc="目标元素", timeout=15000, attempts=3):
+
+    target = locator.first
+    last_err = None
+
+    for i in range(attempts):
+        dismiss_cookie_banner(page)
+        try:
+            target.wait_for(state="visible", timeout=timeout)
+            try:
+                target.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
+            target.click(timeout=timeout)
+            if i > 0:
+                log(f"✅ {desc} 第 {i + 1} 次点击成功")
+            return True
+        except Exception as e:
+            last_err = e
+            log(f"⚠️ 点击 {desc} 第 {i + 1} 次失败: {str(e).splitlines()[0]}")
+            time.sleep(1)
+
+    try:
+        dismiss_cookie_banner(page)
+        target.evaluate("el => el.click()")
+        log(f"⚠️ {desc} 已通过 DOM 原生 click 兜底完成点击")
+        return True
+    except Exception as e:
+        last_err = e
+
+    log(f"❌ 点击 {desc} 最终失败: {str(last_err).splitlines()[0]}")
+    return False
+
+
+def reopen_renew_modal(page, renew_btn, create_btn, attempts=3):
+
+    for _ in range(attempts):
+        try:
+            if create_btn.first.is_visible():
+                return True
+        except Exception:
+            pass
+        if not safe_click(page, renew_btn, desc="Renew 按钮", timeout=10000):
+            return False
+        time.sleep(3)
+        try:
+            create_btn.first.wait_for(state="visible", timeout=8000)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _get_turnstile_token(page):
 
     try:
@@ -1199,12 +1315,15 @@ def login(page):
             log("⚠️ 登录表单的 Turnstile 未确认通过，仍将尝试提交...")
 
         log("🖱️ 点击登录按钮提交...")
-        try:
-            page.click('button[type="submit"]', timeout=8000)
-        except Exception:
-            page.locator(
+        submit_btn = page.locator('button[type="submit"]').first
+        if not safe_click(page, submit_btn, desc="登录按钮", timeout=8000, attempts=2):
+            submit_btn = page.locator(
                 'button:has-text("Sign in"), button:has-text("登录")'
-            ).first.click(timeout=10000)
+            ).first
+            if not safe_click(page, submit_btn, desc="登录按钮", timeout=10000):
+                log("❌ 登录按钮点击失败。")
+                screenshot(page, "login_click_failed")
+                return False
         time.sleep(3)
         handle_cloudflare(page, timeout=240)
         nav_start = time.time()
@@ -1302,6 +1421,7 @@ def renew_service(page):
         if page.url != SERVICE_URL:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
+        dismiss_cookie_banner(page)
 
         log("🖱️ 准备点击 Renew 按钮...")
         renew_btn = page.locator('button:has-text("Renew")')
@@ -1313,7 +1433,10 @@ def renew_service(page):
                 renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
                 log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
-                renew_btn.click()
+                if not safe_click(page, renew_btn, desc="Renew 按钮", timeout=10000):
+                    log("⚠️ Renew 按钮点击失败，准备重试...")
+                    time.sleep(2)
+                    continue
 
                 time.sleep(3)
                 page_text = page.locator("body").inner_text()
@@ -1350,12 +1473,12 @@ def renew_service(page):
         new_invoice_url = None
         for attempt in range(6):
             log(f"🖱️ 点击 'Create Invoice'（第 {attempt + 1} 次）...")
-            try:
-                create_btn.wait_for(state="visible", timeout=20000)
-                create_btn.click(timeout=20000)
-            except Exception as e:
-                log(f"⚠️ 点击 Create Invoice 失败: {e}")
-                solve_modal_turnstile(page, timeout=45)
+            if not safe_click(page, create_btn, desc="Create Invoice", timeout=20000):
+                log("⚠️ Create Invoice 点击失败，尝试重新打开续期弹窗...")
+                if not reopen_renew_modal(page, renew_btn, create_btn):
+                    log("❌ 续期弹窗无法重新打开，放弃本次续期。")
+                    screenshot(page, "renew_modal_lost")
+                    return False
                 continue
 
             start_wait = time.time()
@@ -1374,6 +1497,9 @@ def renew_service(page):
 
             log("⚠️ 未跳转到发票页面，尝试重新完成 Turnstile 验证后重试...")
             solve_modal_turnstile(page, timeout=45)
+            if not reopen_renew_modal(page, renew_btn, create_btn):
+                log("❌ 续期弹窗已关闭且无法重新打开。")
+                break
 
         if not new_invoice_url:
             log("❌ 未能进入发票页面，超时。")
@@ -1388,8 +1514,9 @@ def renew_service(page):
         pay_btn = page.locator(
             'a:has-text("Pay"):visible, button:has-text("Pay"):visible'
         ).first
-        pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.click()
+        if not safe_click(page, pay_btn, desc="Pay 按钮", timeout=30000):
+            screenshot(page, "pay_click_failed")
+            return False
         log("✅ Pay 按钮已点击")
 
         time.sleep(5)
